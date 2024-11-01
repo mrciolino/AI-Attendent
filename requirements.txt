@@ -6,3 +6,5 @@ Pillow
 torch
 torchvision
 typing-extensions
+ultralytics
+requests
