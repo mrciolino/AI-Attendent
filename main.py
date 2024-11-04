@@ -1,25 +1,35 @@
 import cv2
 import numpy as np
-import requests
+import json
 import time
+import socket
+import base64
+import openai
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 from ultralytics.utils.ops import xywh2ltwh
+import os
+
+# TODO: function for -> i need a greating message to welcome the user with image or not "your at itsec say hello"
+# TODO: transcription service for running the transcription model as well (diff process)
+# TODO: be able to give image to the openai api for the chatbot to see the image and respond
 
 # Constants and configuration
 SEND_COOLDOWN = 30  # Cooldown time in seconds
 CONF_THRESHOLD = 0.75  # Confidence threshold for detection
-API_ENDPOINT = "http://your_api_endpoint_here"  # Replace with your API endpoint
+TCP_HOST = "localhost"  # Host for TCP communication
+TCP_PORT = 5000  # Port for TCP communication
+openai.api_key = os.getenv("OPENAI_API_KEY")  # Set OpenAI API key from environment variable
 
 # Load the YOLO model and tracker
 model = YOLO("yolov8s.pt")
 tracker = DeepSort(
-    max_iou_distance=0.6,  # Reduced to avoid incorrect associations in close proximity
-    max_age=60,  # Extended max_age to allow re-identification after short absences
-    n_init=3,  # Retains the default to quickly confirm tracks while filtering noise
-    nms_max_overlap=1.0,  # Keeps NMS disabled, since you may need overlapping tracks in crowded scenes
-    max_cosine_distance=0.3,  # Slightly increased to tolerate minor appearance changes (lighting, angle)
-    gating_only_position=True,  # Only position used for gating, since size changes are less important
+    max_iou_distance=0.6,
+    max_age=60,
+    n_init=3,
+    nms_max_overlap=1.0,
+    max_cosine_distance=0.3,
+    gating_only_position=True,
 )
 
 # Initialize webcam
@@ -41,33 +51,77 @@ inside_roi_ids = set()
 last_send_time = {}
 track_history = set()
 
+# Global chat history to maintain context across calls
+chat_history = []
 
-# API call to send data with specified track ID
-# TODO: Move this to TCP so we can communicate back and forth, to ask for screenshot
-def send_data(track_id):
+
+# Function to send JSON data over TCP with image and other information
+def send_data_via_tcp(track_id, text, animation, speaker):
     last_send_time[track_id] = time.time()
     ret, frame = cap.read()
     if not ret:
         print("Failed to capture frame from camera.")
         return
 
+    # Encode image to JPEG
     _, img_encoded = cv2.imencode(".jpg", frame)
-    files = {"image": ("image.jpg", img_encoded.tobytes(), "image/jpeg"), "track_id": (None, str(track_id))}
+    img_data = img_encoded.tobytes()
 
+    # Prepare JSON data
+    data = {"text": text, "animation": animation, "speaker": speaker}
+    json_data = json.dumps(data)
+
+    # Set up TCP socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((TCP_HOST, TCP_PORT))
+        s.sendall(json_data.encode("utf-8"))
+        response = s.recv(1024)
+        print("Response from server:", response.decode("utf-8"))
+
+
+# Function to process OpenAI API requests with optional image handling and chat history tracking
+def call_openai_api(prompt, image=None, reset_history=False):
+    # Reset chat history if requested
+    global chat_history
+    if reset_history:
+        chat_history = []
+
+    # Model selection
+    model = "gpt-4o-mini" if image else "gpt-4-turbo"
+
+    # If image is provided, encode it to base64
+    image_data = None
+    if image:
+        _, buffer = cv2.imencode(".jpg", image)
+        image_data = base64.b64encode(buffer).decode("utf-8")
+
+    # Prepare message history with the new prompt
+    chat_history.append({"role": "system", "content": "You are Jackson, an AI assistant for the ITSEC Conference."})
+    chat_history.append({"role": "user", "content": prompt})
+    if image:
+        chat_history[-1]["image"] = image_data  # Attach image to the latest user message
+
+    # Call OpenAI API with full chat history
     try:
-        response = requests.post(API_ENDPOINT, files=files)
-        if response.status_code == 200:
-            print(f"Successfully sent data for ID {track_id}.")
-        else:
-            print(f"Failed to send data for ID {track_id}: {response.status_code}")
-    except requests.RequestException as e:
-        print(f"An error occurred while sending data: {e}")
+        response = openai.ChatCompletion.create(model=model, messages=chat_history)
+
+        # Extract and return response content
+        assistant_message = response.choices[0].message["content"]
+
+        # Append assistant's response to chat history for continuity
+        chat_history.append({"role": "assistant", "content": assistant_message})
+
+        return assistant_message
+    except Exception as e:
+        print(f"Error in OpenAI API call: {e}")
+        return None
 
 
 # Handlers for person entering, leaving, and re-entering the ROI
 def on_new_person_enter(track_id):
     print(f"New person detected entering ROI: ID {track_id}")
-    send_data(track_id)
+    text = call_openai_api("Hello, how can I assist you today?", reset_history=True)
+    send_data_via_tcp(track_id, text, "walk-in", "speaker1")
 
 
 def on_person_leave(track_id):
@@ -77,7 +131,7 @@ def on_person_leave(track_id):
 def on_past_person_enter(track_id):
     if time.time() - last_send_time.get(track_id, 0) > SEND_COOLDOWN:
         print(f"Past Track ID {track_id} is back inside ROI.")
-        send_data(track_id)
+        send_data_via_tcp(track_id, "Re-entry detected", "walk-in", "speaker2")
 
 
 # Mouse callback to define the ROI rectangle
@@ -120,7 +174,7 @@ while True:
         )
         for result in results
         for box in result.boxes
-        if box.cls.cpu().numpy().item() == 0 and box.xywh[0][2] * box.xywh[0][3] <= frame.shape[0] * frame.shape[1]  # Assuming class 0 is "person"
+        if box.cls.cpu().numpy().item() == 0  # Assuming class 0 is "person"
     ]
 
     # Update tracker
